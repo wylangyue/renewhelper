@@ -373,6 +373,7 @@ const normalizeNotifyTime = (val) => {
 // 提醒时间选项列表 (00:00~23:30 每30分钟)
 const notifyTimeOptions = Array.from({ length: 48 }, (_, i) => { const h = String(Math.floor(i / 2)).padStart(2, '0'); const m = i % 2 === 0 ? '00' : '30'; return `${h}:${m}`; });
 const form = ref({ id: '', name: '', createDate: '', lastRenewDate: '', intervalDays: 30, cycleUnit: 'day', type: 'cycle', message: '', enabled: true, tags: [], useLunar: false, notifyDays: 3, notifyTime: ['08:00'], autoRenew: true, autoRenewDays: 3, fixedPrice: 0, currency: 'CNY', notifyChannelIds: [], renewHistory: [], renewUrl: '' });
+const DEFAULT_CALENDAR_SUBSCRIPTION_ID = 'default';
 const settingsForm = ref({
     notifyUrl: '',
     enableNotify: true,
@@ -383,6 +384,7 @@ const settingsForm = ref({
     defaultCurrency: 'CNY',
     channels: [], // New structure
     calendarToken: '',
+    calendarSubscriptions: [],
     backupKey: ''
 });
 // const channelMap = reactive({ ... }); // Removed
@@ -438,6 +440,277 @@ const generateUUID = () => {
         const v = c === 'x' ? r : (r & 0x3 | 0x8);
         return v.toString(16);
     });
+};
+
+const getDefaultCalendarSubscriptionName = () => lang.value === 'zh' ? '全部提醒' : 'All Reminders';
+const getNewCalendarSubscriptionName = (index = 1) => lang.value === 'zh' ? `新订阅 ${index}` : `Subscription ${index}`;
+
+const normalizeCalendarSettings = (rawSettings = {}) => {
+    const sourceSubs = Array.isArray(rawSettings.calendarSubscriptions) ? rawSettings.calendarSubscriptions : [];
+    const legacyToken = typeof rawSettings.calendarToken === 'string' && rawSettings.calendarToken.trim()
+        ? rawSettings.calendarToken.trim()
+        : generateUUID();
+    const seenIds = new Set();
+    const seenTokens = new Set();
+    let defaultSub = null;
+    const customSubs = [];
+    const normalizeItemIds = (itemIds) => Array.isArray(itemIds)
+        ? Array.from(new Set(itemIds.map(id => id === null || id === undefined ? '' : String(id).trim()).filter(Boolean)))
+        : [];
+    const nextUniqueToken = () => {
+        let token = generateUUID();
+        while (seenTokens.has(token)) token = generateUUID();
+        return token;
+    };
+
+    sourceSubs.forEach((raw, index) => {
+        if (!raw || typeof raw !== 'object') return;
+        let id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : generateUUID();
+        if (seenIds.has(id)) id = generateUUID();
+        seenIds.add(id);
+
+        let token = typeof raw.token === 'string' && raw.token.trim() ? raw.token.trim() : nextUniqueToken();
+        if (seenTokens.has(token)) token = nextUniqueToken();
+        seenTokens.add(token);
+
+        const isDefault = raw.isDefault === true || id === DEFAULT_CALENDAR_SUBSCRIPTION_ID || token === legacyToken;
+        const sub = {
+            id,
+            name: typeof raw.name === 'string' && raw.name.trim()
+                ? raw.name.trim()
+                : (isDefault ? getDefaultCalendarSubscriptionName() : getNewCalendarSubscriptionName(index + 1)),
+            token,
+            itemIds: normalizeItemIds(raw.itemIds),
+            isDefault
+        };
+        if (sub.isDefault && !defaultSub) {
+            defaultSub = sub;
+        } else {
+            sub.isDefault = false;
+            customSubs.push(sub);
+        }
+    });
+
+    if (!defaultSub) {
+        defaultSub = {
+            id: DEFAULT_CALENDAR_SUBSCRIPTION_ID,
+            name: getDefaultCalendarSubscriptionName(),
+            token: legacyToken,
+            itemIds: [],
+            isDefault: true
+        };
+    }
+
+    defaultSub = {
+        ...defaultSub,
+        id: DEFAULT_CALENDAR_SUBSCRIPTION_ID,
+        name: defaultSub.name && defaultSub.name.trim() ? defaultSub.name.trim() : getDefaultCalendarSubscriptionName(),
+        token: legacyToken,
+        itemIds: normalizeItemIds(defaultSub.itemIds),
+        isDefault: true
+    };
+    seenTokens.add(defaultSub.token);
+
+    customSubs.forEach((sub, index) => {
+        if (!sub.name || !sub.name.trim()) sub.name = getNewCalendarSubscriptionName(index + 1);
+        if (sub.token === defaultSub.token) sub.token = nextUniqueToken();
+        seenTokens.add(sub.token);
+    });
+
+    return {
+        ...rawSettings,
+        calendarToken: legacyToken,
+        calendarSubscriptions: [defaultSub, ...customSubs]
+    };
+};
+
+const prepareCalendarSettingsForSave = () => {
+    const normalized = normalizeCalendarSettings(JSON.parse(JSON.stringify(settingsForm.value)));
+    const seenNames = new Set();
+    for (const sub of normalized.calendarSubscriptions) {
+        const trimmedName = (sub.name || '').trim();
+        if (!trimmedName) {
+            throw new Error(lang.value === 'zh' ? '订阅名称不能为空' : 'Subscription name is required');
+        }
+        const nameKey = trimmedName.toLowerCase();
+        if (seenNames.has(nameKey)) {
+            throw new Error(lang.value === 'zh' ? '订阅名称不能重复' : 'Subscription names must be unique');
+        }
+        seenNames.add(nameKey);
+        sub.name = trimmedName;
+        sub.itemIds = Array.isArray(sub.itemIds) ? Array.from(new Set(sub.itemIds.map(id => String(id)).filter(Boolean))) : [];
+        if (!sub.token) sub.token = generateUUID();
+    }
+    return normalized;
+};
+
+const prepareCalendarSettingsForPersist = (overrides = {}) => {
+    const baseSettings = JSON.parse(JSON.stringify(settings.value || {}));
+    const normalized = normalizeCalendarSettings({
+        ...baseSettings,
+        calendarToken: overrides.calendarToken ?? settingsForm.value.calendarToken,
+        calendarSubscriptions: overrides.calendarSubscriptions ?? settingsForm.value.calendarSubscriptions
+    });
+    const seenNames = new Set();
+    for (const sub of normalized.calendarSubscriptions) {
+        const trimmedName = (sub.name || '').trim();
+        if (!trimmedName) {
+            throw new Error(lang.value === 'zh' ? '订阅名称不能为空' : 'Subscription name is required');
+        }
+        const nameKey = trimmedName.toLowerCase();
+        if (seenNames.has(nameKey)) {
+            throw new Error(lang.value === 'zh' ? '订阅名称不能重复' : 'Subscription names must be unique');
+        }
+        seenNames.add(nameKey);
+        sub.name = trimmedName;
+        sub.itemIds = Array.isArray(sub.itemIds) ? Array.from(new Set(sub.itemIds.map(id => String(id)).filter(Boolean))) : [];
+        if (!sub.token) sub.token = generateUUID();
+    }
+    return normalized;
+};
+
+const persistCalendarSettingsOnly = async (overrides = {}) => {
+    let preparedSettings;
+    try {
+        preparedSettings = prepareCalendarSettingsForPersist(overrides);
+    } catch (e) {
+        ElMessage.error(e.message);
+        return false;
+    }
+
+    loading.value = true;
+    try {
+        const payload = {
+            items: list.value,
+            settings: preparedSettings,
+            version: dataVersion.value
+        };
+        payload.settings.language = lang.value;
+
+        const res = await fetch('/api/save', {
+            method: 'POST',
+            headers: { ...getAuth(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (res.status === 409) {
+            await ElMessageBox.alert(
+                lang.value === 'zh' ? '数据版本冲突！后台系统（或自动续期）已修改了数据。请刷新页面后重试。' : 'Data Conflict! Data has been modified by system or another session. Please refresh.',
+                'Sync Error',
+                { confirmButtonText: 'OK', type: 'error' }
+            );
+            await fetchList();
+            return false;
+        }
+
+        if (!res.ok) throw new Error('Save Failed');
+
+        const d = await res.json();
+        if (d.version) dataVersion.value = d.version;
+
+        settingsForm.value.calendarToken = preparedSettings.calendarToken;
+        settingsForm.value.calendarSubscriptions = JSON.parse(JSON.stringify(preparedSettings.calendarSubscriptions));
+        await fetchList();
+        return true;
+    } catch (e) {
+        ElMessage.error(t('msg.saveFail'));
+        return false;
+    } finally {
+        loading.value = false;
+    }
+};
+
+const calendarSubscriptionOptions = computed(() => {
+    const localeName = lang.value === 'zh' ? 'zh' : 'en';
+    return [...list.value]
+        .sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), localeName))
+        .map(item => ({
+            value: String(item.id),
+            label: item.name || String(item.id),
+            subtitle: Array.isArray(item.tags) && item.tags.length > 0 ? item.tags.join(', ') : ''
+        }));
+});
+
+const getCalendarSubscriptionUrl = (sub) => {
+    const origin = window.location.origin;
+    return sub && sub.token
+        ? `${origin}/api/calendar.ics?token=${sub.token}`
+        : (lang.value === 'zh' ? '保存设置后生成订阅地址...' : 'Save settings to generate URL...');
+};
+
+const getCalendarSubscriptionSummary = (sub) => {
+    const count = Array.isArray(sub?.itemIds) ? sub.itemIds.length : 0;
+    if (count === 0) {
+        return lang.value === 'zh' ? '留空表示包含全部事项' : 'Leave empty to include all items';
+    }
+    return lang.value === 'zh' ? `已选 ${count} 项事项` : `${count} item(s) selected`;
+};
+
+const addCalendarSubscription = () => {
+    const current = Array.isArray(settingsForm.value.calendarSubscriptions) ? settingsForm.value.calendarSubscriptions : [];
+    const nextIndex = current.filter(sub => !sub.isDefault).length + 1;
+    current.push({
+        id: generateUUID(),
+        name: getNewCalendarSubscriptionName(nextIndex),
+        token: generateUUID(),
+        itemIds: [],
+        isDefault: false
+    });
+    settingsForm.value.calendarSubscriptions = current;
+};
+
+const copyCalendarSubscriptionUrl = async (sub) => {
+    try {
+        await navigator.clipboard.writeText(getCalendarSubscriptionUrl(sub));
+        ElMessage.success(t('msg.copyOk'));
+    } catch {
+        ElMessage.error(lang.value === 'zh' ? '复制失败' : 'Copy failed');
+    }
+};
+
+const resetCalendarSubscriptionToken = async (sub) => {
+    const subName = sub?.name || getDefaultCalendarSubscriptionName();
+    try {
+        await ElMessageBox.confirm(
+            lang.value === 'zh'
+                ? `重置订阅「${subName}」后，现有日历链接将立即失效，是否继续？`
+                : `Resetting "${subName}" invalidates its current calendar URL. Continue?`,
+            'Warning',
+            { type: 'warning', confirmButtonText: t('yes'), cancelButtonText: t('no') }
+        );
+        const nextSubscriptions = JSON.parse(JSON.stringify(settingsForm.value.calendarSubscriptions || []));
+        const target = nextSubscriptions.find(item => item.id === sub.id);
+        if (!target) return;
+        target.token = generateUUID();
+        const nextCalendarToken = target.isDefault ? target.token : settingsForm.value.calendarToken;
+        const saved = await persistCalendarSettingsOnly({
+            calendarToken: nextCalendarToken,
+            calendarSubscriptions: nextSubscriptions
+        });
+        if (saved) ElMessage.success(t('msg.tokenReset'));
+    } catch { }
+};
+
+const removeCalendarSubscription = async (sub) => {
+    if (sub.isDefault) {
+        return ElMessage.warning(lang.value === 'zh' ? '默认订阅不能删除' : 'Default subscription cannot be deleted');
+    }
+    try {
+        await ElMessageBox.confirm(
+            lang.value === 'zh'
+                ? `删除订阅「${sub.name}」后，其链接将永久失效，是否继续？`
+                : `Delete subscription "${sub.name}" and invalidate its URL?`,
+            'Warning',
+            { type: 'warning', confirmButtonText: t('yes'), cancelButtonText: t('no') }
+        );
+        const nextSubscriptions = (settingsForm.value.calendarSubscriptions || []).filter(item => item.id !== sub.id);
+        const saved = await persistCalendarSettingsOnly({
+            calendarSubscriptions: nextSubscriptions
+        });
+        if (saved) {
+            ElMessage.success(lang.value === 'zh' ? '订阅已删除' : 'Subscription deleted');
+        }
+    } catch { }
 };
 
 const saveChannel = () => {
@@ -1190,7 +1463,7 @@ const fetchList = async (tk) => {
         }
 
         list.value = d.data.items;
-        settings.value = d.data.settings || {};
+        settings.value = normalizeCalendarSettings(d.data.settings || {});
         if (!settings.value.upcomingBillsDays) settings.value.upcomingBillsDays = 7;
         dataVersion.value = d.data.version || 0;
 
@@ -1629,7 +1902,7 @@ const editItem = (row) => {
     dialogVisible.value = true; 
 };
 const openSettings = () => {
-    settingsForm.value = JSON.parse(JSON.stringify(settings.value));
+    settingsForm.value = normalizeCalendarSettings(JSON.parse(JSON.stringify(settings.value)));
     if (!settingsForm.value.upcomingBillsDays) settingsForm.value.upcomingBillsDays = 7;
     if (!settingsForm.value.channels) settingsForm.value.channels = [];
     settingsVisible.value = true;
@@ -1654,8 +1927,14 @@ const copyBackupKey = async () => {
     } catch { ElMessage.error(lang.value === 'zh' ? '复制失败' : 'Copy failed'); }
 };
 const saveSettings = async (close = true) => {
+    let preparedSettings;
+    try {
+        preparedSettings = prepareCalendarSettingsForSave();
+    } catch (e) {
+        return ElMessage.error(e.message);
+    }
     // Validate Backup Key
-    const bk = settingsForm.value.backupKey;
+    const bk = preparedSettings.backupKey;
     if (bk && bk.trim()) {
         if (bk.length < 8) {
             return ElMessage.error(lang.value === 'zh' ? '备份密钥长度至少8位' : 'Backup Key must be at least 8 chars');
@@ -1665,36 +1944,14 @@ const saveSettings = async (close = true) => {
         }
     }
     const oldCurrency = settings.value.defaultCurrency;
-    settings.value = { ...settingsForm.value };
+    settingsForm.value = preparedSettings;
+    settings.value = { ...preparedSettings };
     await saveData(null, settings.value);
     if (close) settingsVisible.value = false;
 
     if (settings.value.defaultCurrency !== oldCurrency) {
         fetchExchangeRates(settings.value.defaultCurrency);
     }
-};
-const calendarUrl = computed(() => {
-    const origin = window.location.origin;
-    const token = settingsForm.value.calendarToken || settings.value.calendarToken || '';
-    return token ? `${origin}/api/calendar.ics?token=${token}` : 'Save settings to generate URL...';
-});
-
-const copyIcsUrl = () => {
-    navigator.clipboard.writeText(calendarUrl.value).then(() => {
-        ElMessage.success(t('msg.copyOk'));
-    });
-};
-
-const resetCalendarToken = async () => {
-    try {
-        await ElMessageBox.confirm(
-            lang.value === 'zh' ? '重置将导致所有现有日历订阅失效，是否继续？' : 'Resetting invalidates all existing calendar subscriptions. Continue?',
-            'Warning', { type: 'warning', confirmButtonText: t('yes'), cancelButtonText: t('no') }
-        );
-        settingsForm.value.calendarToken = generateUUID();
-        await saveSettings();
-        ElMessage.success(t('msg.tokenReset'));
-    } catch { }
 };
 
 // 迁移旧数据：账单历史 + 通知渠道
@@ -1819,7 +2076,7 @@ const migrateOldData = async (skipConfirm = false) => {
             delete settings.value.notifyConfig;
             delete settings.value.enabledChannels;
             if (settingsVisible.value) {
-                settingsForm.value = JSON.parse(JSON.stringify(settings.value));
+                settingsForm.value = normalizeCalendarSettings(JSON.parse(JSON.stringify(settings.value)));
             }
         }
 
@@ -4372,27 +4629,98 @@ const openLink = (url) => { if (url) window.open(url, '_blank'); };
                                     class="text-base font-bold text-slate-800 dark:text-gray-100 mb-3 pb-2 border-b border-gray-100 dark:border-slate-800">
                                     {{ lang === 'zh' ? '日历订阅' : 'Calendar Subscription' }}</h3>
 
-                                <div
-                                    class="bg-gray-50 dark:bg-slate-800/50 p-3 rounded-lg border border-gray-100 dark:border-slate-700">
-                                    <div class="flex justify-between items-center mb-3">
-                                        <span class="text-sm font-bold text-gray-700 dark:text-gray-300">{{
-                                            t('lblIcsUrl') }}</span>
-                                        <el-button type="primary" link size="small" @click="resetCalendarToken"
-                                            :loading="loading">
-                                            {{ t('btnResetToken') }}
-                                        </el-button>
+                                <div class="flex items-start justify-between gap-3 mb-4">
+                                    <div class="text-xs text-gray-500 leading-relaxed max-w-[560px]">
+                                        {{ lang === 'zh'
+                                            ? '默认订阅兼容旧版单一 token。您可以继续保留它，也可以新增多个独立订阅链接，为每个链接选择不同事项。留空事项表示包含全部事项。'
+                                            : 'The default subscription keeps legacy single-token compatibility. Add more feeds and assign different items to each. Leaving items empty includes everything.' }}
                                     </div>
+                                    <el-button type="primary" link @click="addCalendarSubscription" :icon="Plus">
+                                        {{ lang === 'zh' ? '新增订阅' : 'Add Subscription' }}
+                                    </el-button>
+                                </div>
 
-                                    <div class="flex gap-2 w-full">
-                                        <el-input v-model="calendarUrl" readonly id="icsUrlInput" class="flex-1">
-                                        </el-input>
-                                        <el-button class="mecha-btn !rounded-sm" @click="copyIcsUrl">
-                                            {{ t('btnCopy') }}
-                                        </el-button>
-                                    </div>
-                                    <div class="mt-4 text-xs text-gray-400 leading-relaxed">
-                                        {{ lang === 'zh' ? '您可以将此链接添加到各类日历软件（如 Google Calendar, iOS Calendar）中，以订阅您的续费提醒事项。' :
-                                        'Subscribe to this URL in calendar apps (Google Calendar, iOS) to sync renewable events.' }}
+                                <div class="space-y-4">
+                                    <div v-for="sub in settingsForm.calendarSubscriptions" :key="sub.id"
+                                        class="bg-gray-50 dark:bg-slate-800/50 p-4 rounded-lg border border-gray-100 dark:border-slate-700">
+                                        <div class="flex flex-col lg:flex-row lg:items-start gap-3 mb-3">
+                                            <div class="flex-1 min-w-0">
+                                                <div class="flex items-center gap-2 mb-2 flex-wrap">
+                                                    <span
+                                                        class="text-[10px] px-2 py-0.5 rounded font-bold tracking-wide"
+                                                        :class="sub.isDefault
+                                                            ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                                                            : 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200'">
+                                                        {{ sub.isDefault ? (lang === 'zh' ? '默认订阅' : 'DEFAULT') : (lang === 'zh' ? '自定义订阅' : 'CUSTOM') }}
+                                                    </span>
+                                                    <span class="text-xs text-gray-400">{{ getCalendarSubscriptionSummary(sub) }}</span>
+                                                </div>
+                                                <el-input v-model="sub.name"
+                                                    :placeholder="lang === 'zh' ? '例如：生日提醒' : 'e.g. Birthday Reminders'">
+                                                    <template #prefix>
+                                                        <el-icon>
+                                                            <Calendar />
+                                                        </el-icon>
+                                                    </template>
+                                                </el-input>
+                                            </div>
+
+                                            <div class="flex items-center gap-2 shrink-0">
+                                                <el-button class="mecha-btn !rounded-sm" @click="copyCalendarSubscriptionUrl(sub)">
+                                                    {{ t('btnCopy') }}
+                                                </el-button>
+                                                <el-button type="primary" link size="small"
+                                                    @click="resetCalendarSubscriptionToken(sub)" :loading="loading">
+                                                    {{ t('btnResetToken') }}
+                                                </el-button>
+                                                <el-button v-if="!sub.isDefault" type="danger" link size="small"
+                                                    @click="removeCalendarSubscription(sub)">
+                                                    {{ lang === 'zh' ? '删除' : 'Delete' }}
+                                                </el-button>
+                                            </div>
+                                        </div>
+
+                                        <div class="space-y-3">
+                                            <div>
+                                                <div class="text-xs text-gray-500 mb-1">{{ t('lblIcsUrl') }}</div>
+                                                <el-input :model-value="getCalendarSubscriptionUrl(sub)" readonly class="w-full">
+                                                    <template #prefix>
+                                                        <el-icon>
+                                                            <Link />
+                                                        </el-icon>
+                                                    </template>
+                                                </el-input>
+                                            </div>
+
+                                            <div>
+                                                <div class="flex items-center justify-between gap-3 mb-1">
+                                                    <div class="text-xs text-gray-500">
+                                                        {{ lang === 'zh' ? '关联事项' : 'Linked Items' }}
+                                                    </div>
+                                                    <div class="text-[11px] text-gray-400">
+                                                        {{ lang === 'zh' ? '可按项目名称搜索' : 'Search by item name' }}
+                                                    </div>
+                                                </div>
+                                                <el-select v-model="sub.itemIds" multiple filterable clearable
+                                                    collapse-tags collapse-tags-tooltip :max-collapse-tags="4"
+                                                    style="width:100%"
+                                                    :placeholder="lang === 'zh' ? '留空则包含全部事项' : 'Leave empty for all items'">
+                                                    <el-option v-for="item in calendarSubscriptionOptions" :key="item.value"
+                                                        :label="item.label" :value="item.value">
+                                                        <div class="flex items-center justify-between gap-3">
+                                                            <span class="truncate">{{ item.label }}</span>
+                                                            <span v-if="item.subtitle"
+                                                                class="text-[11px] text-gray-400 truncate">{{ item.subtitle }}</span>
+                                                        </div>
+                                                    </el-option>
+                                                </el-select>
+                                                <div class="mt-2 text-xs text-gray-400 leading-relaxed">
+                                                    {{ lang === 'zh'
+                                                        ? '选择后，该订阅只输出这些事项；清空则输出全部启用事项。刷新 token 会立即让旧链接失效。'
+                                                        : 'When items are selected, this feed only exports those items. Clearing the selection exports all enabled items. Resetting the token invalidates the old URL immediately.' }}
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                             </div>

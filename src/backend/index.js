@@ -340,6 +340,163 @@ const Auth = {
     },
 };
 
+const DEFAULT_CALENDAR_SUBSCRIPTION_ID = "default";
+const getDefaultCalendarSubscriptionName = (lang = "zh") =>
+    lang === "en" ? "All Reminders" : "全部提醒";
+
+function normalizeCalendarSubscriptions(settings = {}) {
+    const lang = settings.language === "en" ? "en" : "zh";
+    const source = Array.isArray(settings.calendarSubscriptions)
+        ? settings.calendarSubscriptions
+        : [];
+    const legacyToken =
+        typeof settings.calendarToken === "string" && settings.calendarToken.trim()
+            ? settings.calendarToken.trim()
+            : "";
+
+    let changed = !Array.isArray(settings.calendarSubscriptions);
+    const seenIds = new Set();
+    const seenTokens = new Set();
+    let defaultSub = null;
+    const customSubs = [];
+
+    const normalizeItemIds = (itemIds) => {
+        if (!Array.isArray(itemIds)) {
+            changed = true;
+            return [];
+        }
+        const normalized = Array.from(
+            new Set(
+                itemIds
+                    .map((id) => (id === null || id === undefined ? "" : String(id).trim()))
+                    .filter(Boolean)
+            )
+        );
+        if (normalized.length !== itemIds.length) changed = true;
+        return normalized;
+    };
+
+    const nextUniqueToken = () => {
+        let token = crypto.randomUUID();
+        while (seenTokens.has(token)) token = crypto.randomUUID();
+        return token;
+    };
+
+    for (const raw of source) {
+        if (!raw || typeof raw !== "object") {
+            changed = true;
+            continue;
+        }
+
+        let id =
+            typeof raw.id === "string" && raw.id.trim()
+                ? raw.id.trim()
+                : crypto.randomUUID();
+        if (seenIds.has(id)) {
+            id = crypto.randomUUID();
+            changed = true;
+        }
+        seenIds.add(id);
+
+        let token =
+            typeof raw.token === "string" && raw.token.trim()
+                ? raw.token.trim()
+                : nextUniqueToken();
+        if (seenTokens.has(token)) {
+            token = nextUniqueToken();
+            changed = true;
+        }
+        seenTokens.add(token);
+
+        const itemIds = normalizeItemIds(raw.itemIds);
+        const isDefaultCandidate =
+            raw.isDefault === true ||
+            id === DEFAULT_CALENDAR_SUBSCRIPTION_ID ||
+            (!!legacyToken && token === legacyToken);
+        const fallbackName = isDefaultCandidate
+            ? getDefaultCalendarSubscriptionName(lang)
+            : `Calendar ${customSubs.length + 1}`;
+        const name =
+            typeof raw.name === "string" && raw.name.trim()
+                ? raw.name.trim()
+                : fallbackName;
+        if (name !== raw.name) changed = true;
+
+        const normalizedSub = {
+            id,
+            name,
+            token,
+            itemIds,
+            isDefault: !!isDefaultCandidate,
+        };
+
+        if (isDefaultCandidate && !defaultSub) {
+            defaultSub = normalizedSub;
+        } else {
+            normalizedSub.isDefault = false;
+            customSubs.push(normalizedSub);
+        }
+    }
+
+    if (!defaultSub) {
+        defaultSub = {
+            id: DEFAULT_CALENDAR_SUBSCRIPTION_ID,
+            name: getDefaultCalendarSubscriptionName(lang),
+            token: legacyToken || nextUniqueToken(),
+            itemIds: [],
+            isDefault: true,
+        };
+        changed = true;
+    }
+
+    if (defaultSub.id !== DEFAULT_CALENDAR_SUBSCRIPTION_ID) {
+        changed = true;
+        seenIds.delete(defaultSub.id);
+        defaultSub.id = DEFAULT_CALENDAR_SUBSCRIPTION_ID;
+    }
+
+    if (!defaultSub.name || !defaultSub.name.trim()) {
+        defaultSub.name = getDefaultCalendarSubscriptionName(lang);
+        changed = true;
+    }
+
+    if (legacyToken) {
+        if (defaultSub.token !== legacyToken) {
+            seenTokens.delete(defaultSub.token);
+            defaultSub.token = legacyToken;
+            changed = true;
+        }
+    } else if (!defaultSub.token || !defaultSub.token.trim()) {
+        defaultSub.token = nextUniqueToken();
+        changed = true;
+    }
+
+    seenTokens.add(defaultSub.token);
+    defaultSub.isDefault = true;
+
+    for (const sub of customSubs) {
+        if (sub.token === defaultSub.token) {
+            sub.token = nextUniqueToken();
+            changed = true;
+        }
+        seenTokens.add(sub.token);
+    }
+
+    const calendarSubscriptions = [defaultSub, ...customSubs];
+    if (
+        settings.calendarToken !== defaultSub.token ||
+        calendarSubscriptions.length !== source.length
+    ) {
+        changed = true;
+    }
+
+    return {
+        calendarToken: defaultSub.token,
+        calendarSubscriptions,
+        changed,
+    };
+}
+
 const DataStore = {
     KEYS: { SETTINGS: "SYS_CONFIG", ITEMS: "DATA_ITEMS", LOGS: "LOGS" },
 
@@ -359,6 +516,7 @@ const DataStore = {
             defaultCurrency: "CNY",
             jwtSecret: "",
             calendarToken: "",
+            calendarSubscriptions: [],
             enabledChannels: [],
             notifyConfig: {
                 telegram: { token: "", chatId: "", apiServer: "" },
@@ -388,12 +546,23 @@ const DataStore = {
             save = true;
         }
 
+        const normalizedCalendars = normalizeCalendarSubscriptions(s);
+        if (normalizedCalendars.changed) save = true;
+        s.calendarToken = normalizedCalendars.calendarToken;
+        s.calendarSubscriptions = normalizedCalendars.calendarSubscriptions;
+
         if (save) await this.saveSettings(env, s);
         return s;
     },
 
     async saveSettings(env, data) {
-        await env.RENEW_KV.put(this.KEYS.SETTINGS, JSON.stringify(data, null, 2));
+        const normalizedCalendars = normalizeCalendarSubscriptions(data || {});
+        const payload = {
+            ...data,
+            calendarToken: normalizedCalendars.calendarToken,
+            calendarSubscriptions: normalizedCalendars.calendarSubscriptions,
+        };
+        await env.RENEW_KV.put(this.KEYS.SETTINGS, JSON.stringify(payload, null, 2));
     },
 
     async getItemsPackage(env) {
@@ -1654,6 +1823,7 @@ app.post(
         // 1. 先获取新的设置（为了拿到最新的时区 timezone）
         const currentSettings = await DataStore.getSettings(env);
         const newSettings = {
+            ...currentSettings,
             ...body.settings,
             jwtSecret: currentSettings.jwtSecret,
         };
@@ -1854,12 +2024,26 @@ app.post(
 app.get("/api/calendar.ics", async (req, env, url) => {
     const token = url.searchParams.get("token");
     const settings = await DataStore.getSettings(env);
-    if (!token || token !== settings.calendarToken)
+    const calendarSubscriptions = Array.isArray(settings.calendarSubscriptions)
+        ? settings.calendarSubscriptions
+        : [];
+    const subscription = token
+        ? calendarSubscriptions.find((sub) => sub.token === token)
+        : null;
+    if (!token || !subscription)
         return new Response("Unauthorized: Invalid Calendar Token", {
             status: 401,
         });
 
-    const items = await DataStore.getItems(env);
+    const selectedItemIds =
+        Array.isArray(subscription.itemIds) && subscription.itemIds.length > 0
+            ? new Set(subscription.itemIds.map((id) => String(id)))
+            : null;
+    const items = (await DataStore.getItems(env)).filter((item) => {
+        if (!item.enabled) return false;
+        if (!selectedItemIds) return true;
+        return selectedItemIds.has(String(item.id));
+    });
     const lang = settings.language === "en" ? "en" : "zh";
 
     const T = {
@@ -1902,7 +2086,7 @@ app.get("/api/calendar.ics", async (req, env, url) => {
         "VERSION:2.0",
         "PRODID:-//RenewHelper//Calendar//EN",
         "METHOD:PUBLISH",
-        "X-WR-CALNAME:RenewHelper",
+        `X-WR-CALNAME:${formatIcsText(subscription.name || "RenewHelper")}`,
         "REFRESH-INTERVAL;VALUE=DURATION:P1D",
         "CALSCALE:GREGORIAN",
         `X-WR-TIMEZONE:${userTz}`,
@@ -1911,8 +2095,6 @@ app.get("/api/calendar.ics", async (req, env, url) => {
         new Date().toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
 
     items.forEach((item) => {
-        if (!item.enabled) return;
-
         // 计算基于用户时区的日期
         const st = calculateStatus(item, settings.timezone);
         const dueStr = st.nextDueDate.replace(/-/g, ""); // Start: YYYYMMDD
@@ -1924,7 +2106,11 @@ app.get("/api/calendar.ics", async (req, env, url) => {
         const endStr = Calc.toYMD(endDateObj).replace(/-/g, "");
 
         parts.push("BEGIN:VEVENT");
-        parts.push(`UID:${item.id}@renewhelper`);
+        const uidPrefix =
+            subscription.id && subscription.id !== DEFAULT_CALENDAR_SUBSCRIPTION_ID
+                ? `${subscription.id}:`
+                : "";
+        parts.push(`UID:${uidPrefix}${item.id}@renewhelper`);
         parts.push(`DTSTAMP:${dtStamp}`);
         parts.push(`DTSTART;VALUE=DATE:${dueStr}`);
         parts.push(`DTEND;VALUE=DATE:${endStr}`);
